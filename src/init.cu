@@ -324,12 +324,14 @@ static void showVersion() {
   }
 }
 
-static ncclResult_t fillInfo(struct ncclInfo* info, int rank) {
+static ncclResult_t fillInfo(struct ncclInfo* info, int rank, uint64_t commHash) {
   for (int t=0; t<NTRANSPORTS; t++) {
-    NCCLCHECK(ncclTransports[t].fillInfo(info->tinfo+t, rank));
+    NCCLCHECK(ncclTransports[t].fillInfo(info->tinfo+t, rank, commHash));
   }
   return ncclSuccess;
 }
+
+bool SetCpuAffinity(int cudaDev, nvmlDevice_t* nvmlDevice);
 
 template <int type>
 static ncclResult_t selectTransport(struct ncclInfo* myInfo, struct ncclInfo* peerInfo, struct ncclConnect* connect, struct ncclTransport** transportRet, struct ncclRing* ring) {
@@ -339,8 +341,15 @@ static ncclResult_t selectTransport(struct ncclInfo* myInfo, struct ncclInfo* pe
     ncclTvalue_t ret = 0;
     NCCLCHECK(transport->canConnect(&ret, myInfo->tinfo+t, peerInfo->tinfo+t));
     if (ret > 0) {
+      cpu_set_t affinitySave;
+      nvmlDevice_t nvmlDevice;
+      int cudaDev;
+      CUDACHECK(hipGetDevice(&cudaDev));
+      sched_getaffinity(0, sizeof(cpu_set_t), &affinitySave);
+      SetCpuAffinity(cudaDev, &nvmlDevice);
       NCCLCHECK(transportComm->setup(myInfo->tinfo+t, peerInfo->tinfo+t, connect, ring));
       *transportRet = transport;
+      sched_setaffinity(0, sizeof(cpu_set_t), &affinitySave);
       return ncclSuccess;
     }
   }
@@ -392,7 +401,7 @@ static void swap(void* mem1, void* mem2, int size) {
   memcpy(tmp, mem1, size); memcpy(mem1, mem2, size); memcpy(mem2, tmp, size);
 }
 
-#define MAXWIDTH 20
+#define MAXWIDTH 64
 #define PREFIXLEN 15
 #define STRLENGTH (PREFIXLEN+5*MAXWIDTH)
 void dumpMatrix(int* connectMatrix, int nranks) {
@@ -478,8 +487,8 @@ void* waitForNonNullPtr(void* p) {
 }
 
 ncclResult_t initParams(struct ncclComm* comm) {
-  struct cudaLaunchParams* params = comm->myParams = comm->intraParams+comm->intraRank;
-  params->args = &comm->argsptr;
+  hipLaunchParams* params = comm->myParams = comm->intraParams+comm->intraRank;
+  params->args = (void **)&comm->argsptr;
   params->stream = NULL;
   params->sharedMem = 0;
   params->blockDim.x = 0; params->blockDim.y = params->blockDim.z = 1;
@@ -512,7 +521,7 @@ ncclResult_t ncclCommSetIntra(struct ncclComm* comm, int rank, int ranks, struct
     comm->intraCC = CC;
   } else {
     comm->intraBarrier = (int*)waitForNonNullPtr(&comm0->intraBarrier);
-    comm->intraParams = (struct cudaLaunchParams*)waitForNonNullPtr(&comm0->intraParams);
+    comm->intraParams = (hipLaunchParams*)waitForNonNullPtr(&comm0->intraParams);
     comm->intraCudaDevs = (int*)waitForNonNullPtr(&comm0->intraCudaDevs);
     comm->intraCGMode = (int*)waitForNonNullPtr(&comm0->intraCGMode);
     comm->intraCC = (int*)waitForNonNullPtr(&comm0->intraCC);
@@ -520,7 +529,7 @@ ncclResult_t ncclCommSetIntra(struct ncclComm* comm, int rank, int ranks, struct
   comm->intraCudaDevs[comm->intraRank] = comm->cudaDev;
   NCCLCHECK(initParams(comm));
 
-  int cgMdLaunch = 0;
+  int cgMdLaunch = 1;
 
   // Set CG Mode
   comm->launchMode = ncclComm::GROUP;
@@ -549,11 +558,13 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, ncclUniqueId* comm
   int rank = comm->rank;
   int nranks = comm->nRanks;
   void* commState;
+  uint64_t commHash = getnHash(commId->internal, NCCL_UNIQUE_ID_BYTES);
+  TRACE(NCCL_INIT, "comm %p, commHash %lu, rank %d nranks %d - BEGIN", comm, commHash, rank, nranks);
   NCCLCHECK(bootstrapInit(commId, rank, nranks, &commState));
 
   struct ncclInfo* allInfo;
   NCCLCHECK(ncclCalloc(&allInfo, nranks));
-  NCCLCHECK(fillInfo(allInfo+rank, rank));
+  NCCLCHECK(fillInfo(allInfo+rank, rank, commHash));
   NCCLCHECK(bootstrapAllGather(commState, allInfo, sizeof(struct ncclInfo)));
 
   int* connectTransport;
@@ -773,7 +784,7 @@ static ncclResult_t initTransportsAll(struct ncclComm** comms, const int* devs, 
   NCCLCHECK(ncclCalloc(&allInfo, nranks));
   for (int rank=0; rank<nranks; rank++) {
     CUDACHECK(hipSetDevice(devs[rank]));
-    NCCLCHECK(fillInfo(allInfo+rank, rank));
+    NCCLCHECK(fillInfo(allInfo+rank, rank, 0));
   }
 
   int* connectTransport;
